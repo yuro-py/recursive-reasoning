@@ -1,0 +1,76 @@
+-------------------------------NOTES FROM CLAUDE:-
+
+1. The key design choice: ptrm.py should not reimplement TRM — PTRM is purely an inference-time procedure wrapped around a trained TRM checkpoint (noise injection + Q-head selection, no architecture changes, no retraining)PTRM injects Gaussian noise at each deep recursion step, enabling parallel trajectories to explore diverse solution basins, and selects among them using the model's existing Q head. So you implement the architecture once (TRM), and PTRM is ~50 lines of inference logic. Keep that separation strict — it's what keeps your codebase minimal.
+FPRM is a genuinely separate architecture (non-hierarchical, transformer-block-based instead of TRM's tied 2-layer net), so it gets its own file, but it can import shared primitives from blocks.py — especially once you swap in DeepSeek-style blocks, since FPRM and any future variant can both use them.
+
+
+2. Build order
+a. TRM (foundation, everything else depends on understanding this)
+b. PTRM (thin wrapper, cheap to add once TRM works)
+c. FPRM with classical transformer (get it correct against the paper first)
+d. FPRM with DeepSeek block swapped in (isolate the architecture change so you can benchmark it cleanly against step 3)
+
+Don't skip step 3. If you go straight to the DeepSeek variant you won't have a clean ablation — you want "FPRM-classical vs FPRM-DeepSeek-block" as a controlled comparison, which is actually a nice result for your writeup.
+
+
+3. TRM — the core recursion
+The whole model is one tiny 2-layer network reused for two different update types, distinguished only by whether the input x is included:
+
+a. Latent update (n times): z ← f_θ(x + y + z)
+b. Answer update (once): y ← f_θ(y + z)
+
+A "deep recursion" runs this T times, only the last one keeping gradients. Training uses deep supervision: z and y persist (detached) across up to N_sup supervision steps, with cross-entropy loss on the answer and a binary cross-entropy loss on a Q head that predicts whether the current answer is already correct — this Q head is what ACT halting uses at train time, and what PTRM repurposes at inference.
+
+Math you actually need here:
+a. Backprop through weight-tied recursion (you already have from your MIT PSET work on shared-weight gradients — this generalizes directly)
+b. Basic contraction/fixed-point intuition (informal at this stage — it becomes rigorous when you hit FPRM)
+c. Cross-entropy + BCE, nothing exotic
+
+
+4. PTRM — stochastic test-time scaling
+At each supervision step, inject Gaussian noise into the latent before the recursion call, run K parallel rollouts, and select the one with the highest Q-head score at the endat each supervision step, we add Gaussian noise (scaled by σ) to the latent state input. The Q head fQ scores each candidate latent output, and the one with the highest Q value is selected and then decoded using the model's output head. That's the entire algorithm — Algorithm 1 in the paper is about 10 lines of pseudocode. Implementation-wise this is just:
+------------------------------------------------------------
+def ptrm_infer(trm, x, K, D, sigma):
+    z, y = trm.init(x, batch=K)          # K parallel copies
+    for t in range(D):
+        z = z + torch.randn_like(z) * sigma
+        z, y = trm.deep_recursion_step(x, z, y)
+    q = trm.q_head(y)                     # [K]
+    best = q.argmax()
+    return trm.output_head(y[best])
+------------------------------------------------------------
+
+Math: just Gaussian sampling, which you already flagged as a priority — nothing beyond N(0, σ²I) injected additively.
+One important detail for your writeup: PTRM's gains come almost entirely from width (K), not depth — tripling depth alone gave a few points, while scaling K to 100 gave ~29 points on their puzzle benchmark. If your GPU is memory-constrained, this matters: K rollouts are embarrassingly parallel but still cost K× memory per batch, so on a 4GB card you'll want to sweep K in small increments and watch VRAM before assuming you can hit K=100.
+
+
+
+5. FPRM — looped transformer with fixed-point halting
+This is architecturally the most involved piece, and the one where your DeepSeek-block swap lives. Three modifications on top of a standard looped transformer:
+(a) Pre-norm instead of post-norm. Looped models conventionally use post-norm because it keeps activations bounded across iterations, but that comes at a real trainability cost at depth — pre-norm fixes signal propagation but loses boundedness on its own.
+(b) Residual scaling to recover boundedness under pre-norm. Two scaling schemes, both with learnable tied scalars:
+a. Layer-wise: z^ℓ = α₁·z^(ℓ-1) + β₁·f^ℓ(Norm_pre(z^(ℓ-1)))
+b. Iteration-wise (between loop iterations, re-injecting the input): z_(i+1)^0 = α₂·z_i^(2L) + β₂·x
+
+There's a closed-form coupling between (α₁, β₁, β₂) that provably bounds the iterates (their Theorem 1) — worth deriving yourself since it's a direct application of geometric series / contraction bounds, which is exactly the fixed-point math you flagged as a priority.
+
+(c) Fixed-point halting. Instead of a learned ACT head, the model just loops until it converges: r_i = ||z_i - f_θ(z_i)||_∞ / (||f_θ(z_i)||_∞ + ε), halting when r_i < τ. To prevent oscillation around the fixed point (which they show can happen when the Jacobian has eigenvalues with real part < 1 but modulus ≥ 1), they use a damped update z ← η·f_θ(z) + (1-η)·z with a patience-based decay schedule on η (their FPOpt, Algorithm 1) — this is the practical "does it actually converge" fix layered on top of the theory.
+
+Training uses truncated BPTT justified by the implicit function theorem: dz*/dθ = (I-J)^-1 P ≈ Σ_{j=0}^{k-1} J^j P, with error decaying exponentially in truncation depth k for contractive J (their Proposition 1). This is a clean, self-contained thing to actually derive by hand — it's the Neumann series applied to a fixed-point gradient, good exercise before you implement it.
+
+Math priorities for this file specifically: Banach fixed-point theorem / contraction mappings (you already flagged this — it's now not optional, it's load-bearing), Jacobian spectral radius intuition for the damping argument, Neumann series for the truncated-BPTT gradient.
+
+
+6. The DeepSeek-block swap
+FPRM's f^ℓ is a plain transformer sub-layer (standard multi-head attention + FFN, interleaved with the norm placement above). Your swap target is that sub-layer only — nothing about the pre-norm/residual-scaling/fixed-point machinery around it changes. Concretely:
+
+a. Replace standard MHA with Multi-head Latent Attention (MLA): compress Q and K/V into a shared low-rank latent before projecting to heads, with a decoupled RoPE path for the position-sensitive part of the query/key. This is almost certainly what your 2x speedup test picked up — MLA's KV compression cuts both compute and cache size.
+b. If you also want the FFN side, DeepSeek's dense blocks use RMSNorm + SwiGLU instead of LayerNorm + ReLU/GeLU MLP. Cheap to implement, decent free efficiency win, orthogonal to MLA.
+c. I'd leave DeepSeekMoE (routed experts) out. At 5–7M total parameters and seq_len ~100 (that's PPBench's grid size), you don't have enough capacity or sequence length for expert routing to pay for its own complexity — it's built for scaling to billions of params, not tiny puzzle-solvers. Worth a one-line note in your writeup on why you scoped it out.
+
+Since f^ℓ appears in both the layer-wise and iteration-wise residual equations, the theory doesn't care what's inside f^ℓ as long as it's a bounded map — meaning your FPRM harness genuinely doesn't need to change when you swap the block, which is a nice property to explicitly verify (measure ||f^ℓ(u)|| empirically for both blocks and confirm the boundedness assumption in Theorem 1 still roughly holds).
+
+
+
+7. Hardware reality check for your 4GB card
+All three papers train at 5–7M params, seq_len ~100–900 depending on benchmark, on a single H100 — but the parameter count is what matters for you, not the H100. 7M params in fp32 is ~28MB of weights; your constraint will be activation memory across recursion steps during truncated BPTT, not weight storage. Use torch.cuda.amp (fp16/bf16) and keep the truncation depth k small early on — that's your main lever if you hit OOM, and it's also the exact quantity Proposition 1 tells you how to reason about (error vs. compute tradeoff), so tuning it for your GPU and understanding the math are the same exercise.
