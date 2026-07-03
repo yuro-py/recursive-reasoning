@@ -1,4 +1,4 @@
--------------------------------NOTES FROM CLAUDE:-
+NOTES FROM CLAUDE:-
 
 1. The key design choice: ptrm.py should not reimplement TRM — PTRM is purely an inference-time procedure wrapped around a trained TRM checkpoint (noise injection + Q-head selection, no architecture changes, no retraining)PTRM injects Gaussian noise at each deep recursion step, enabling parallel trajectories to explore diverse solution basins, and selects among them using the model's existing Q head. So you implement the architecture once (TRM), and PTRM is ~50 lines of inference logic. Keep that separation strict — it's what keeps your codebase minimal.
 FPRM is a genuinely separate architecture (non-hierarchical, transformer-block-based instead of TRM's tied 2-layer net), so it gets its own file, but it can import shared primitives from blocks.py — especially once you swap in DeepSeek-style blocks, since FPRM and any future variant can both use them.
