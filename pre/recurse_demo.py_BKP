@@ -1,0 +1,97 @@
+import torch, torch.nn as nn, torch.optim as optim
+
+net = nn.Linear(4,4)
+x = torch.tensor([10, 20, 30, 40], dtype=torch.float32)
+y = torch.tensor([10000], dtype=torch.float32)
+
+net = nn.Sequential(
+        nn.Linear(4,16),
+        nn.ReLU(),
+        nn.Linear(16,8),
+        nn.ReLU(),
+        nn.Linear(8,1),
+)
+
+criterion = nn.MSELoss()
+optimizer = optim.Adam(net.parameters(), lr = 0.01)
+
+for step in range(50000):
+    out = net(x)
+    loss = criterion(out, y)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if step % 5000 == 0:
+        print(f"step : {step} | loss : {loss.item():.2f} | out : {out.item():.2f}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""import torch, torch.nn as nn
+import torch.optim as optim
+
+
+net = nn.Linear(4,4)
+state = torch.tensor([100000,200000,300000,400000], dtype=torch.float32)
+true= torch.tensor([500000,600000,700000,800000], dtype=torch.float32)
+criterion = nn.MSELoss()
+optimizer = optim.Adam(net.parameters(), lr= 0.001)
+
+for step in range(5000):
+    out = net(state)
+    loss = criterion(out, true)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if step % 500 == 10:
+        print(f"{step}: {out}")
+"""
+
+
+
+
+
+
+"""
+y = model(x)
+loss = mseloss(x,y)
+loss.backward()
+optimizer.zero_grad()
+optimizer.step()
+"""
